@@ -200,6 +200,7 @@ function autoCtx(choice?: string, answer?: string) {
 	return {
 		hasUI: true,
 		mode: "rpc",
+		close: () => {},
 		ui: {
 			select: async (title: string, labels: string[]) => {
 				rule();
@@ -228,6 +229,10 @@ async function interactiveCtx() {
 	return {
 		hasUI: true,
 		mode: "rpc",
+		// The readline handle keeps the event loop alive; close it once we're
+		// done so the process exits even on a numbered pick (where input() is
+		// never reached and therefore never closes it).
+		close: () => rl.close(),
 		ui: {
 			select: async (title: string, labels: string[]) => {
 				rule();
@@ -263,16 +268,21 @@ if (!useInteractive && !process.stdin.isTTY) {
 }
 
 // --- Run the tool and let the agent continue --------------------------------
-const result = await tool.execute("demo-call", toolCall, undefined, undefined, ctx);
-const answer = result.details.answer;
+try {
+	const result = await tool.execute("demo-call", toolCall, undefined, undefined, ctx);
+	const answer = result.details.answer;
 
-console.log("\nTOOL RESULT returned to the agent (content text):");
-console.log(result.content[0].text);
-console.log("\nTOOL RESULT details.answer:");
-console.log(JSON.stringify(answer, null, 2));
+	console.log("\nTOOL RESULT returned to the agent (content text):");
+	console.log(result.content[0].text);
+	console.log("\nTOOL RESULT details.answer:");
+	console.log(JSON.stringify(answer, null, 2));
 
-console.log("\nAGENT continues using answer.value =", JSON.stringify(answer.value));
-const continuation =
-	scenario.continuations[answer.value] ??
-	"apply the user's answer, restating it in the next action.";
-console.log(`  → ${continuation}`);
+	console.log("\nAGENT continues using answer.value =", JSON.stringify(answer.value));
+	const continuation =
+		scenario.continuations[answer.value] ??
+		"apply the user's answer, restating it in the next action.";
+	console.log(`  → ${continuation}`);
+} finally {
+	// Release the interactive prompt so Node can exit.
+	ctx.close();
+}
