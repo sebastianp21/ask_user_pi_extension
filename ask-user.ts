@@ -30,15 +30,20 @@ import { Type } from "typebox";
 
 const FREEFORM_LABEL = "Write my own answer…";
 
-interface AskOption {
+export interface AskOption {
 	label: string;
 	description?: string;
+	/** Value returned when this option is chosen. Defaults to the label. */
+	value?: string;
 }
 
 type DisplayOption = AskOption & { isFreeform?: boolean; isRecommended?: boolean };
 
-interface Answer {
+export interface Answer {
+	/** Display text of the answer (the option label, or the free-form text) */
 	text: string;
+	/** Value the option returns; falls back to the label, and equals `text` for free-form answers */
+	value: string;
 	/** 1-based index of the chosen option; undefined for free-form answers */
 	index?: number;
 	wasFreeform: boolean;
@@ -52,14 +57,17 @@ interface AskUserDetails {
 	options: string[];
 	allowFreeform: boolean;
 	answer: Answer | null;
-	/** Why there is no answer: user cancelled, aborted, or no UI available */
-	reason?: "cancelled" | "aborted" | "no-ui";
+	/** Why there is no answer: user cancelled, aborted, invalid input, or no UI available */
+	reason?: "cancelled" | "aborted" | "no-ui" | "invalid";
 }
 
 const OptionSchema = Type.Object({
 	label: Type.String({ description: "Short, concrete choice (1-8 words)" }),
 	description: Type.Optional(
 		Type.String({ description: "What picking this option means: trade-offs, consequences" }),
+	),
+	value: Type.Optional(
+		Type.String({ description: "Value returned when this option is chosen. Defaults to the label." }),
 	),
 });
 
@@ -92,16 +100,80 @@ function result(text: string, details: AskUserDetails) {
 }
 
 /** Text the model receives for a given answer. */
-function describeAnswer(question: string, answer: Answer): string {
+export function describeAnswer(question: string, answer: Answer): string {
 	const lines = [`Question: ${question}`];
 	if (answer.wasFreeform) {
 		lines.push(`The user wrote their own answer: ${answer.text}`);
 	} else {
-		lines.push(`The user selected option ${answer.index}: ${answer.text}`);
+		const value = answer.value ?? answer.text;
+		lines.push(
+			value === answer.text
+				? `The user selected option ${answer.index}: ${value}`
+				: `The user selected option ${answer.index}: ${value} (label: "${answer.text}")`,
+		);
 		if (answer.note) lines.push(`User's note: ${answer.note}`);
 	}
 	lines.push("Proceed according to this decision.");
 	return lines.join("\n");
+}
+
+/**
+ * Normalize the `options` argument, tolerating common model serialization
+ * mistakes: a JSON-encoded string, a single option object, or plain strings.
+ * Always returns an array of well-formed options.
+ */
+export function normalizeOptions(raw: unknown): AskOption[] {
+	let value = raw;
+	if (typeof value === "string") {
+		try {
+			value = JSON.parse(value);
+		} catch {
+			return [];
+		}
+	}
+	if (!Array.isArray(value)) value = value == null ? [] : [value];
+
+	const options: AskOption[] = [];
+	for (const entry of value) {
+		if (typeof entry === "string") {
+			const label = entry.trim();
+			if (label) options.push({ label });
+			continue;
+		}
+		if (!entry || typeof entry !== "object") continue;
+		const record = entry as Record<string, unknown>;
+		if (typeof record.label !== "string" || !record.label.trim()) continue;
+		const option: AskOption = { label: record.label };
+		if (typeof record.description === "string") option.description = record.description;
+		if (typeof record.value === "string") option.value = record.value;
+		options.push(option);
+	}
+	return options;
+}
+
+/** Coerce a 1-based option index, accepting numeric strings, or drop it. */
+function coerceRecommended(raw: unknown): number | undefined {
+	if (typeof raw === "number" && Number.isInteger(raw)) return raw;
+	if (typeof raw === "string" && /^\d+$/.test(raw.trim())) return Number(raw.trim());
+	return undefined;
+}
+
+/**
+ * Compatibility shim run before schema validation: repairs an `options`
+ * argument that the model serialized as a JSON string or a single object, and
+ * coerces a stringified `recommended` index. The declared schema stays
+ * array-based.
+ */
+export function prepareAskUserArguments(args: unknown): Record<string, unknown> {
+	if (!args || typeof args !== "object" || Array.isArray(args)) {
+		return { options: [] };
+	}
+	const input = args as Record<string, unknown>;
+	const prepared: Record<string, unknown> = { ...input, options: normalizeOptions(input.options) };
+	const recommended = coerceRecommended(input.recommended);
+	if (recommended === undefined) delete prepared.recommended;
+	else prepared.recommended = recommended;
+	return prepared;
 }
 
 export default function askUser(pi: ExtensionAPI) {
@@ -119,6 +191,8 @@ export default function askUser(pi: ExtensionAPI) {
 			"If ask_user reports the user cancelled, do not ask the same question again; stop and explain what you need.",
 		],
 		parameters: AskUserParams,
+		// Returns the schema-shaped arguments; normalization is validated by the schema afterwards.
+		prepareArguments: (args: unknown) => prepareAskUserArguments(args) as any,
 		executionMode: "sequential",
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -132,7 +206,11 @@ export default function askUser(pi: ExtensionAPI) {
 			};
 
 			if (options.length === 0 && !allowFreeform) {
-				throw new Error("ask_user needs at least one option, or allowFreeform must be true");
+				return result(
+					"ask_user received invalid arguments: there are no usable options and free-form answers are disabled. " +
+						"Provide 2-5 options (or allow free-form answers) before trying again.",
+					{ ...base, answer: null, reason: "invalid" },
+				);
 			}
 			const recommended =
 				params.recommended && params.recommended <= options.length ? params.recommended : undefined;
@@ -184,7 +262,14 @@ export default function askUser(pi: ExtensionAPI) {
 				return new Text(first?.type === "text" ? first.text : "", 0, 0);
 			}
 			if (!details.answer) {
-				const label = details.reason === "no-ui" ? "No user available" : details.reason === "aborted" ? "Aborted" : "Cancelled";
+				const label =
+				details.reason === "no-ui"
+					? "No user available"
+					: details.reason === "aborted"
+						? "Aborted"
+						: details.reason === "invalid"
+							? "Invalid request"
+							: "Cancelled";
 				return new Text(theme.fg("warning", label), 0, 0);
 			}
 			const a = details.answer;
@@ -216,7 +301,7 @@ async function askWithDialogs(
 
 	if (options.length === 0) {
 		const text = (await ctx.ui.input(title, "Your answer", { signal }))?.trim();
-		return text ? { text, wasFreeform: true } : null;
+		return text ? { text, value: text, wasFreeform: true } : null;
 	}
 
 	const labels = options.map((o, i) => {
@@ -231,9 +316,10 @@ async function askWithDialogs(
 	const index = labels.indexOf(picked);
 	if (index === options.length) {
 		const text = (await ctx.ui.input(question, "Your answer", { signal }))?.trim();
-		return text ? { text, wasFreeform: true } : null;
+		return text ? { text, value: text, wasFreeform: true } : null;
 	}
-	return { text: options[index].label, index: index + 1, wasFreeform: false };
+	const option = options[index];
+	return { text: option.label, value: option.value ?? option.label, index: index + 1, wasFreeform: false };
 }
 
 /** Interactive terminal: custom component with options list and inline editor. */
@@ -298,10 +384,16 @@ function askInTui(
 			const text = value.trim();
 			if (mode === "note") {
 				const opt = all[index];
-				finish({ text: opt.label, index: index + 1, wasFreeform: false, note: text || undefined });
+				finish({
+					text: opt.label,
+					value: opt.value ?? opt.label,
+					index: index + 1,
+					wasFreeform: false,
+					note: text || undefined,
+				});
 				return;
 			}
-			if (text) finish({ text, wasFreeform: true });
+			if (text) finish({ text, value: text, wasFreeform: true });
 			else backToList();
 		};
 
@@ -315,7 +407,7 @@ function askInTui(
 				mode = "note";
 				refresh();
 			} else {
-				finish({ text: opt.label, index: i + 1, wasFreeform: false });
+				finish({ text: opt.label, value: opt.value ?? opt.label, index: i + 1, wasFreeform: false });
 			}
 		};
 
