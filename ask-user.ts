@@ -17,18 +17,374 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-	Editor,
-	type EditorTheme,
-	Key,
-	matchesKey,
-	Text,
-	visibleWidth,
-	wrapTextWithAnsi,
-} from "@earendil-works/pi-tui";
-import { Type } from "typebox";
 
 const FREEFORM_LABEL = "Write my own answer…";
+
+// ---------------------------------------------------------------------------
+// Self-contained terminal primitives
+//
+// Pi normally provides `@earendil-works/pi-tui` and `typebox` as host modules.
+// This extension imports neither, so it can be loaded and tested with nothing
+// installed: the small subset of TUI helpers it needs lives here, and the tool
+// schema below is plain JSON Schema (validated by Pi's bundled TypeBox).
+// ---------------------------------------------------------------------------
+
+export const Key = {
+	escape: "escape",
+	esc: "esc",
+	enter: "enter",
+	return: "return",
+	tab: "tab",
+	backspace: "backspace",
+	delete: "delete",
+	home: "home",
+	end: "end",
+	up: "up",
+	down: "down",
+	left: "left",
+	right: "right",
+} as const;
+
+const KEY_SEQUENCES: Record<string, string[]> = {
+	escape: ["\x1b"],
+	enter: ["\r", "\n", "\x1bOM"],
+	tab: ["\t"],
+	backspace: ["\x7f", "\b"],
+	delete: ["\x1b[3~"],
+	home: ["\x1b[H", "\x1bOH", "\x1b[1~", "\x1b[7~"],
+	end: ["\x1b[F", "\x1bOF", "\x1b[4~", "\x1b[8~"],
+	up: ["\x1b[A", "\x1bOA"],
+	down: ["\x1b[B", "\x1bOB"],
+	right: ["\x1b[C", "\x1bOC"],
+	left: ["\x1b[D", "\x1bOD"],
+};
+
+const KITTY_CODEPOINTS: Record<string, number> = { escape: 27, tab: 9, enter: 13, backspace: 127 };
+const KITTY_KP_ENTER = 57414;
+const CSI_DIRECTIONS: Record<string, string> = { A: "up", B: "down", C: "right", D: "left", H: "home", F: "end" };
+
+/** True when raw terminal input matches a key identifier such as `Key.up`. */
+export function matchesKey(data: string, key: string): boolean {
+	if (data === key) return true;
+	if (KEY_SEQUENCES[key]?.includes(data)) return true;
+	const kitty = /^\x1b\[(\d+)(?:;\d+)?u$/.exec(data);
+	if (kitty) {
+		const codepoint = Number(kitty[1]);
+		if (codepoint === KITTY_CODEPOINTS[key]) return true;
+		if (key === "enter" && codepoint === KITTY_KP_ENTER) return true;
+	}
+	const csi = /^\x1b\[(?:1(?:;\d+)?)?([ABCDHF])$/.exec(data);
+	if (csi && CSI_DIRECTIONS[csi[1]] === key) return true;
+	return false;
+}
+
+const ANSI_ESCAPE = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+const SGR = /^\x1b\[([0-9;]*)m/;
+
+function stripAnsi(text: string): string {
+	return text.replace(ANSI_ESCAPE, "");
+}
+
+function charWidth(codepoint: number): number {
+	if (codepoint === 0 || codepoint < 32 || (codepoint >= 0x7f && codepoint < 0xa0)) return 0;
+	if (
+		(codepoint >= 0x0300 && codepoint <= 0x036f) ||
+		(codepoint >= 0x1ab0 && codepoint <= 0x1aff) ||
+		(codepoint >= 0x1dc0 && codepoint <= 0x1dff) ||
+		(codepoint >= 0x20d0 && codepoint <= 0x20ff) ||
+		(codepoint >= 0xfe20 && codepoint <= 0xfe2f)
+	) {
+		return 0;
+	}
+	if (
+		(codepoint >= 0x1100 && codepoint <= 0x115f) ||
+		(codepoint >= 0x2e80 && codepoint <= 0x303e) ||
+		(codepoint >= 0x3041 && codepoint <= 0x33ff) ||
+		(codepoint >= 0x3400 && codepoint <= 0x4dbf) ||
+		(codepoint >= 0x4e00 && codepoint <= 0x9fff) ||
+		(codepoint >= 0xa000 && codepoint <= 0xa4cf) ||
+		(codepoint >= 0xac00 && codepoint <= 0xd7a3) ||
+		(codepoint >= 0xf900 && codepoint <= 0xfaff) ||
+		(codepoint >= 0xfe10 && codepoint <= 0xfe19) ||
+		(codepoint >= 0xfe30 && codepoint <= 0xfe6f) ||
+		(codepoint >= 0xff00 && codepoint <= 0xff60) ||
+		(codepoint >= 0xffe0 && codepoint <= 0xffe6) ||
+		(codepoint >= 0x1f300 && codepoint <= 0x1faff) ||
+		(codepoint >= 0x20000 && codepoint <= 0x3fffd)
+	) {
+		return 2;
+	}
+	return 1;
+}
+
+/** Visible width of a string in terminal columns, ignoring ANSI escape codes. */
+export function visibleWidth(text: string): number {
+	if (!text) return 0;
+	let width = 0;
+	for (const ch of stripAnsi(text).replace(/\t/g, "   ")) width += charWidth(ch.codePointAt(0) ?? 0);
+	return width;
+}
+
+type SgrGroup = number[];
+
+function removeGroups(active: SgrGroup[], predicate: (group: SgrGroup) => boolean): void {
+	for (let i = active.length - 1; i >= 0; i--) {
+		if (predicate(active[i])) active.splice(i, 1);
+	}
+}
+
+function isBasicFg(param: number): boolean {
+	return (param >= 30 && param <= 37) || (param >= 90 && param <= 97);
+}
+
+function isBasicBg(param: number): boolean {
+	return (param >= 40 && param <= 47) || (param >= 100 && param <= 107);
+}
+
+function applySgr(paramsText: string, active: SgrGroup[]): void {
+	const params = paramsText === "" ? [0] : paramsText.split(";").map((value) => Number(value) || 0);
+	let i = 0;
+	while (i < params.length) {
+		const param = params[i];
+		if (param === 0) {
+			active.length = 0;
+			i += 1;
+			continue;
+		}
+		if (param === 39) {
+			removeGroups(active, (group) => group[0] === 38 || group[0] === 39 || isBasicFg(group[0]));
+			i += 1;
+			continue;
+		}
+		if (param === 49) {
+			removeGroups(active, (group) => group[0] === 48 || group[0] === 49 || isBasicBg(group[0]));
+			i += 1;
+			continue;
+		}
+		if (param === 22) {
+			removeGroups(active, (group) => group[0] === 1 || group[0] === 2);
+			i += 1;
+			continue;
+		}
+		if (param >= 23 && param <= 29) {
+			removeGroups(active, (group) => group[0] === param - 20);
+			i += 1;
+			continue;
+		}
+		if (param === 38 || param === 48) {
+			const isFg = param === 38;
+			removeGroups(
+				active,
+				(group) => group[0] === param || (isFg ? isBasicFg(group[0]) : isBasicBg(group[0])),
+			);
+			if (params[i + 1] === 5) {
+				active.push([param, 5, params[i + 2] ?? 0]);
+				i += 3;
+				continue;
+			}
+			if (params[i + 1] === 2) {
+				active.push([param, 2, params[i + 2] ?? 0, params[i + 3] ?? 0, params[i + 4] ?? 0]);
+				i += 5;
+				continue;
+			}
+			active.push([param]);
+			i += 1;
+			continue;
+		}
+		if (isBasicFg(param)) {
+			removeGroups(active, (group) => group[0] === 38 || isBasicFg(group[0]));
+			active.push([param]);
+			i += 1;
+			continue;
+		}
+		if (isBasicBg(param)) {
+			removeGroups(active, (group) => group[0] === 48 || isBasicBg(group[0]));
+			active.push([param]);
+			i += 1;
+			continue;
+		}
+		if (!active.some((group) => group.length === 1 && group[0] === param)) active.push([param]);
+		i += 1;
+	}
+}
+
+function activeSequence(active: SgrGroup[]): string {
+	return active.length ? `\x1b[${active.map((group) => group.join(";")).join(";")}m` : "";
+}
+
+interface WordAtom {
+	text: string;
+	width: number;
+}
+
+function splitWordAtoms(word: string): WordAtom[] {
+	const atoms: WordAtom[] = [];
+	let pending = "";
+	let i = 0;
+	while (i < word.length) {
+		const sgr = SGR.exec(word.slice(i));
+		if (sgr) {
+			pending += sgr[0];
+			i += sgr[0].length;
+			continue;
+		}
+		const codepoint = word.codePointAt(i) ?? 0;
+		const ch = String.fromCodePoint(codepoint);
+		i += ch.length;
+		atoms.push({ text: pending + ch, width: charWidth(codepoint) });
+		pending = "";
+	}
+	if (pending) {
+		if (atoms.length) atoms[atoms.length - 1].text += pending;
+		else atoms.push({ text: pending, width: 0 });
+	}
+	return atoms;
+}
+
+/** Word-wrap text to `width` visible columns, preserving ANSI styling across lines. */
+export function wrapTextWithAnsi(text: string, width: number): string[] {
+	if (!text) return [""];
+	const maxWidth = Math.max(1, width);
+	const result: string[] = [];
+	const active: SgrGroup[] = [];
+
+	for (const inputLine of text.split(/\r\n|\r|\n/)) {
+		let line = activeSequence(active);
+		let lineWidth = 0;
+		let word = "";
+		let wordWidth = 0;
+		let spaces = "";
+		let spacesWidth = 0;
+
+		const breakLine = () => {
+			result.push(line + (active.length ? "\x1b[0m" : ""));
+			line = activeSequence(active);
+			lineWidth = 0;
+		};
+		const placeWord = () => {
+			if (!word) return;
+			if (lineWidth > 0 && lineWidth + spacesWidth + wordWidth > maxWidth) {
+				breakLine();
+				spaces = "";
+				spacesWidth = 0;
+			}
+			if (wordWidth > maxWidth && lineWidth === 0) {
+				for (const atom of splitWordAtoms(word)) {
+					if (lineWidth > 0 && lineWidth + atom.width > maxWidth) breakLine();
+					line += atom.text;
+					lineWidth += atom.width;
+				}
+			} else {
+				line += spaces + word;
+				lineWidth += spacesWidth + wordWidth;
+				spaces = "";
+				spacesWidth = 0;
+			}
+			word = "";
+			wordWidth = 0;
+		};
+
+		let i = 0;
+		while (i < inputLine.length) {
+			const sgr = SGR.exec(inputLine.slice(i));
+			if (sgr) {
+				applySgr(sgr[1], active);
+				word += sgr[0];
+				i += sgr[0].length;
+				continue;
+			}
+			const codepoint = inputLine.codePointAt(i) ?? 0;
+			const ch = String.fromCodePoint(codepoint);
+			i += ch.length;
+			if (ch === " " || ch === "\t") {
+				placeWord();
+				spaces += ch === "\t" ? "   " : ch;
+				spacesWidth += ch === "\t" ? 3 : 1;
+			} else {
+				word += ch;
+				wordWidth += charWidth(codepoint);
+			}
+		}
+		placeWord();
+		result.push(line + (active.length ? "\x1b[0m" : ""));
+	}
+	return result.length ? result : [""];
+}
+
+/** Minimal multi-line text component compatible with Pi's renderer. */
+export class Text {
+	text: string;
+	paddingX: number;
+	paddingY: number;
+
+	constructor(text = "", paddingX = 1, paddingY = 1) {
+		this.text = text;
+		this.paddingX = paddingX;
+		this.paddingY = paddingY;
+	}
+
+	setText(text: string): void {
+		this.text = text;
+	}
+
+	invalidate(): void {}
+
+	render(width: number): string[] {
+		if (!this.text || this.text.trim() === "") return [];
+		const w = Math.max(1, width);
+		const paddingX = Math.min(this.paddingX, Math.max(0, Math.floor((w - 1) / 2)));
+		const contentWidth = Math.max(1, w - paddingX * 2);
+		const left = " ".repeat(paddingX);
+		const right = " ".repeat(paddingX);
+		const lines: string[] = [];
+		for (const line of wrapTextWithAnsi(this.text.replace(/\t/g, "   "), contentWidth)) {
+			const padded = left + line + right;
+			lines.push(padded + " ".repeat(Math.max(0, w - visibleWidth(padded))));
+		}
+		if (this.paddingY > 0) {
+			const empty = " ".repeat(w);
+			const blank = Array.from({ length: this.paddingY }, () => empty);
+			return [...blank, ...lines, ...blank];
+		}
+		return lines;
+	}
+}
+
+function isIgnoredInput(data: string): boolean {
+	if (data.startsWith("\x1b")) return true;
+	for (const ch of data) {
+		const code = ch.codePointAt(0) ?? 0;
+		if (code < 32 && ch !== "\t" && ch !== "\n" && ch !== "\r") return true;
+	}
+	return false;
+}
+
+/** Minimal single-line editor compatible with the picker above. */
+export class Editor {
+	text = "";
+	onSubmit: (value: string) => void = () => {};
+
+	setText(text: string): void {
+		this.text = text;
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, Key.enter)) {
+			this.onSubmit(this.text);
+			return;
+		}
+		if (matchesKey(data, Key.backspace)) {
+			this.text = this.text.slice(0, -1);
+			return;
+		}
+		if (isIgnoredInput(data)) return;
+		this.text += data;
+	}
+
+	render(_width: number): string[] {
+		return [this.text];
+	}
+}
 
 export interface AskOption {
 	label: string;
@@ -61,39 +417,39 @@ interface AskUserDetails {
 	reason?: "cancelled" | "aborted" | "no-ui" | "invalid";
 }
 
-const OptionSchema = Type.Object({
-	label: Type.String({ description: "Short, concrete choice (1-8 words)" }),
-	description: Type.Optional(
-		Type.String({ description: "What picking this option means: trade-offs, consequences" }),
-	),
-	value: Type.Optional(
-		Type.String({ description: "Value returned when this option is chosen. Defaults to the label." }),
-	),
-});
+const OptionSchema = {
+	type: "object",
+	required: ["label"],
+	properties: {
+		label: { type: "string", description: "Short, concrete choice (1-8 words)" },
+		description: { type: "string", description: "What picking this option means: trade-offs, consequences" },
+		value: { type: "string", description: "Value returned when this option is chosen. Defaults to the label." },
+	},
+};
 
-const AskUserParams = Type.Object({
-	question: Type.String({
-		description: "The decision to resolve, phrased as a clear question ending with '?'",
-	}),
-	context: Type.Optional(
-		Type.String({
+const AskUserParams = {
+	type: "object",
+	required: ["question", "options"],
+	properties: {
+		question: { type: "string", description: "The decision to resolve, phrased as a clear question ending with '?'" },
+		context: {
+			type: "string",
 			description: "Why you cannot decide this yourself: what you found and what the choice depends on. Keep it brief.",
-		}),
-	),
-	options: Type.Array(OptionSchema, {
-		description: "2-5 mutually exclusive choices. May be empty only if allowFreeform is true.",
-		maxItems: 8,
-	}),
-	recommended: Type.Optional(
-		Type.Integer({
+		},
+		options: {
+			type: "array",
+			items: OptionSchema,
+			description: "2-5 mutually exclusive choices. May be empty only if allowFreeform is true.",
+			maxItems: 8,
+		},
+		recommended: {
+			type: "integer",
 			minimum: 1,
 			description: "1-based index of the option you recommend, if any. It is shown first-selected and marked.",
-		}),
-	),
-	allowFreeform: Type.Optional(
-		Type.Boolean({ description: "Offer a free-form text answer in addition to the options (default: true)" }),
-	),
-});
+		},
+		allowFreeform: { type: "boolean", description: "Offer a free-form text answer in addition to the options (default: true)" },
+	},
+};
 
 function result(text: string, details: AskUserDetails) {
 	return { content: [{ type: "text" as const, text }], details };
@@ -353,17 +709,7 @@ function askInTui(
 		let mode: "list" | "edit" | "note" = all.length === 1 && all[0].isFreeform ? "edit" : "list";
 		let cached: string[] | undefined;
 
-		const editorTheme: EditorTheme = {
-			borderColor: (s) => theme.fg("accent", s),
-			selectList: {
-				selectedPrefix: (t) => theme.fg("accent", t),
-				selectedText: (t) => theme.fg("accent", t),
-				description: (t) => theme.fg("muted", t),
-				scrollInfo: (t) => theme.fg("dim", t),
-				noMatch: (t) => theme.fg("warning", t),
-			},
-		};
-		const editor = new Editor(tui, editorTheme);
+		const editor = new Editor();
 
 		const refresh = () => {
 			cached = undefined;

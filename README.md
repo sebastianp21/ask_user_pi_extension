@@ -82,15 +82,50 @@ validation and repairs the common cases: an options array sent as a JSON
 string, a single option object instead of an array, plain-string options, and a
 stringified `recommended` index. The schema itself is unchanged.
 
+## Demo
+
+`ask-user.demo.ts` runs the whole loop against the real extension: a task with
+an unresolved choice, the agent calling `ask_user`, a user answering, the answer
+returned to the agent, and the agent continuing with the returned `value`. It
+needs no Pi install and no dependencies.
+
+Pass your own task and it automatically picks a matching question (by keyword):
+
+```bash
+node ask-user.demo.ts                                  # default task
+node ask-user.demo.ts "add rate limiting to the API"   # derives a question
+node ask-user.demo.ts --list                           # show scenarios
+```
+
+Answer interactively, or script the answer:
+
+```bash
+node ask-user.demo.ts --interactive "add caching"              # you type it
+node ask-user.demo.ts --choice 2 "which database"              # pick option 2
+node ask-user.demo.ts --answer "use memcached" "add caching"   # free-form
+```
+
+When stdin is not a TTY (for example in CI), the demo answers with the
+recommended option automatically.
+
 ## Tests
 
 The interaction logic and the registered tool are covered by Node's built-in
-test runner (`ask-user.test.ts`, 31 tests). The tests stub the two Pi runtime
-packages through a small loader hook so they run without a Pi install:
+test runner (`ask-user.test.ts`, 31 tests). The extension has no runtime
+dependencies, so the tests import it directly:
 
 ```bash
-node --import ./test/hooks.mjs --test ask-user.test.ts
+node --test ask-user.test.ts
 ```
 
 This needs Node 22.6+ for TypeScript type stripping. There is no build step and
-no test dependencies.
+no dependencies.
+
+## Dependencies
+
+None. The extension imports only Pi's `ExtensionAPI` **type** (erased at load
+time). The handful of terminal helpers it needs — key matching, text wrapping,
+width measurement, a text component, and an inline editor — are implemented in
+the file itself, and the tool parameters are described with plain JSON Schema,
+which Pi validates with its bundled TypeBox. That means the file loads and tests
+without `@earendil-works/pi-tui` or `typebox` installed.

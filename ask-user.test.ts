@@ -2,16 +2,16 @@
  * Tests for the ask_user extension.
  *
  * Run with:
- *   node --import ./test/hooks.mjs --test ask-user.test.ts
+ *   node --test ask-user.test.ts
  *
- * The loader hook maps the two Pi runtime packages to local stubs so the
- * extension can be imported without a Pi install. See test/hooks.mjs.
+ * The extension has no runtime dependencies, so it can be imported directly
+ * (Node 22.6+ strips the type-only Pi import) with no loader hook.
  */
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Key } from "@earendil-works/pi-tui";
 import askUser, {
+	Key,
 	describeAnswer,
 	normalizeOptions,
 	prepareAskUserArguments,
@@ -228,8 +228,8 @@ test("the registered tool exposes the expected shape", () => {
 	const tool = captureTool();
 	assert.equal(tool.name, "ask_user");
 	assert.equal(typeof tool.prepareArguments, "function");
-	assert.equal(tool.parameters.properties.options.kind, "array");
-	assert.equal(tool.parameters.properties.options.items.properties.value.kind, "string");
+	assert.equal(tool.parameters.properties.options.type, "array");
+	assert.equal(tool.parameters.properties.options.items.properties.value.type, "string");
 });
 
 test("execute reports no-ui distinctly when no human is available", async () => {
